@@ -1,7 +1,9 @@
 package org.corfudb.runtime.object.transactions;
 
+import lombok.Data;
 import lombok.Getter;
 
+import lombok.RequiredArgsConstructor;
 import org.corfudb.protocols.logprotocol.SMREntry;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
@@ -51,6 +53,35 @@ public abstract class AbstractTransactionalContext {
     @Getter
     public long commitAddress = AbstractTransactionalContext.UNCOMMITTED_ADDRESS;
 
+    /** The parent context of this transaction, if in a nested transaction.*/
+    @Getter
+    AbstractTransactionalContext parentContext;
+
+    /** A wrapper which combines SMREntries with
+     * their upcall result.
+     */
+    @Data
+    @RequiredArgsConstructor
+    static class UpcallWrapper {
+        final SMREntry entry;
+        Object upcallResult;
+        boolean haveUpcallResult;
+    }
+
+    /** Return the write set for this transaction
+     *
+     * @return  The write set, which contains all modifications this
+     *          transaction will make.
+     */
+    abstract public Map<UUID, List<UpcallWrapper>> getWriteSet();
+
+    /** Return the read set for this transaction
+     *
+     * @return  The read set, which contains all objects read by this
+     *          transaction.
+     */
+    abstract public Set<UUID> getReadSet();
+
     /**
      * A future which gets completed when this transaction commits.
      * It is completed exceptionally when the transaction aborts.
@@ -62,6 +93,7 @@ public abstract class AbstractTransactionalContext {
         transactionID = UUID.randomUUID();
         this.runtime = runtime;
         this.startTime = System.currentTimeMillis();
+        this.parentContext = TransactionalContext.getCurrentContext();
     }
 
     /** Access the state of the object.

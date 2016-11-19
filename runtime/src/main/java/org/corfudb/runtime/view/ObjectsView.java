@@ -217,18 +217,11 @@ public class ObjectsView extends AbstractView {
             log.trace("Exiting (committing) transactional context {} (time={} ms).",
                     context.getTransactionID(), totalTime);
 
-            if (TransactionalContext.getTransactionStack().size() > 1) {
-                TransactionalContext.removeContext();
-                log.trace("Transaction {} within context {}, writing to context.", context.getTransactionID(),
-                        TransactionalContext.getCurrentContext().getTransactionID());
-                TransactionalContext.getCurrentContext().addTransaction(context);
-            } else {
                 try {
                     TransactionalContext.getCurrentContext().commitTransaction();
                 } finally {
                     TransactionalContext.removeContext();
                 }
-            }
         }
     }
 

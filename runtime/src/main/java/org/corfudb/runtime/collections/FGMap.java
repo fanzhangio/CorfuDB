@@ -365,7 +365,7 @@ public class FGMap<K, V> extends AbstractCorfuContainer<FGMap<K,V>>
         return getAllPartitionMaps().stream()
                 .map(Map::values)
                 .flatMap(Collection::stream)
-                .collect(Collectors.toSet());
+                .collect(Collectors.toList());
     }
 
     /**

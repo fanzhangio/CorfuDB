@@ -275,6 +275,7 @@ public class AbstractCorfuTest {
     @Before
     public void resetThreadingTest() {
         threadsMap.clear();
+        lastException = null;
     }
 
     @After

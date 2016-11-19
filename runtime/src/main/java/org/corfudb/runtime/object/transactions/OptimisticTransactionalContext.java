@@ -66,58 +66,28 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
         }
     }
 
-    /** A wrapper which combines SMREntries with
-     * their upcall result.
-     */
-    @Data
-    @RequiredArgsConstructor
-    private static class UpcallWrapper {
-        final SMREntry entry;
-        Object upcallResult;
-        boolean haveUpcallResult;
-    }
-
     /** The write set for this transaction.*/
+    @Getter
     private Map<UUID, List<UpcallWrapper>> writeSet = new ConcurrentHashMap<>();
 
     /** The read set for this transaction. */
+    @Getter
     private Set<UUID> readSet = new HashSet<>();
 
-    /** The write pointers for this transaction.
-     * For each proxy, this map keeps track of the furthest
-     * position each proxy has synced to.
-     */
-    private Map<ICorfuSMRProxyInternal, Integer> writeSetPointer = new ConcurrentHashMap<>();
-
-    /** Helper function to get the current write set pointer for a proxy.
-     *
-     * @param proxy     The proxy to get the write set pointer for
-     * @return          The current write set pointer for the proxy.
-     */
-    private int getWriteSetPointer(ICorfuSMRProxyInternal proxy) {
-        return writeSetPointer.getOrDefault(proxy, 0);
+    int getNumberParentUpdates(UUID streamID) {
+        AbstractTransactionalContext p = this;
+        int num = 0;
+        while ((p = p.getParentContext()) != null) {
+            num += p.getWriteSet().get(streamID) == null ?
+                    0 : p.getWriteSet().get(streamID).size();
+        }
+        return num;
     }
 
-    /** Helper function to increment the write set pointer for a proxy.
-     *
-     * @param proxy     The proxy to increment the write set pointer to.
-     */
-    private void incrementWriteSetPointer(ICorfuSMRProxyInternal proxy) {
-        writeSetPointer.compute(proxy, (k,v) -> {
-            if (v == null) return 0;
-            return v+1;
-        });
-    }
-
-    /** Helper function to clear the write set pointer.
-     *
-     * @param proxy     The proxy to clear the write set pointer for.
-     */
-    private void clearWriteSetPointer(ICorfuSMRProxyInternal proxy) {
-        // We have to be careful when clearing, since the
-        // writeSetPointer is used to track objects we've
-        // modified.
-        writeSetPointer.computeIfPresent(proxy, (k,v) -> 0);
+    int getNumberTotalUpdates(UUID streamID) {
+        return getNumberParentUpdates(streamID) +
+                (getWriteSet().get(streamID) == null ?
+                0 : getWriteSet().get(streamID).size());
     }
 
     /** Helper function to get a write set for a particular stream.
@@ -149,7 +119,7 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
                                 .doUndo(proxy.getUnderlyingObject().getObjectUnsafe(),
                                         entry.getUndoRecord(), entry.getSMRArguments()));
                 // Lift our transactional context
-                clearWriteSetPointer(proxy);
+                proxy.getUnderlyingObject().clearOptimisticVersionUnsafe();
                 proxy.getUnderlyingObject().setTXContextUnsafe(null);
             }
             throw new UnsupportedOperationException("Couldn't undo...");
@@ -157,7 +127,6 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
             // rolling back failed, so we'll resort to getting fresh state
             proxy.resetObjectUnsafe(proxy.getUnderlyingObject());
             proxy.getUnderlyingObject().setTXContextUnsafe(null);
-            clearWriteSetPointer(proxy);
             proxy.syncObjectUnsafe(proxy.getUnderlyingObject(),
                     proxy.getVersion());
         }
@@ -235,11 +204,12 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
         // finally, if we have buffered updates in the write set,
         // we need to apply them.
 
-        if ((getWriteSet(proxy.getStreamID()).size()
-                != getWriteSetPointer(proxy))) {
+        if ((getNumberTotalUpdates(proxy.getStreamID())
+                != proxy.getUnderlyingObject().getOptimisticVersionUnsafe())) {
             proxy.getUnderlyingObject()
                     .setTXContextUnsafe(TransactionalContext.getTransactionStack());
-            IntStream.range(getWriteSetPointer(proxy),
+            IntStream.range(proxy.getUnderlyingObject().getOptimisticVersionUnsafe()
+                    - getNumberParentUpdates(proxy.getStreamID()),
                     getWriteSet(proxy.getStreamID()).size())
                     .mapToObj(x -> getWriteSet(proxy.getStreamID()).get(x))
                     .forEach(wrapper -> {
@@ -247,7 +217,6 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
                         // Find the upcall...
                         ICorfuSMRUpcallTarget<T> target =
                                 proxy.getUpcallTargetMap().get(entry.getSMRMethod());
-                        incrementWriteSetPointer(proxy);
                         if (target == null) {
                             throw new
                                     RuntimeException("Unknown upcall " + entry.getSMRMethod());
@@ -266,10 +235,11 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
                             proxy.getUnderlyingObject()
                                     .setNotOptimisticallyUndoable();
                         }
-
                         try {
                              wrapper.setUpcallResult(target.upcall(proxy.getUnderlyingObject()
                                     .getObjectUnsafe(), entry.getSMRArguments()));
+                            proxy.getUnderlyingObject()
+                                    .optimisticVersionIncrementUnsafe();
                              wrapper.setHaveUpcallResult(true);
                         }
                         catch (Exception e) {
@@ -295,28 +265,25 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
 
         // Next, we check if the write set has any
         // outstanding modifications.
-        // This will determine whether or not we need
-        // a write lock.
-        if (getWriteSet(proxy.getStreamID()).size() == getWriteSetPointer(proxy)) {
-            // If the version is correct, now we can try
-            // to service the read by taking a read lock.
-            try {
-                return proxy.getUnderlyingObject().optimisticallyReadAndRetry((v, o) -> {
-                    // to ensure snapshot isolation, we should only read from
-                    // the first read timestamp.
-                            // Either not in a TX
-                    if ( (!proxy.getUnderlyingObject().isTransactionallyModifiedUnsafe() ||
-                            // Or we are the TX
-                            proxy.getUnderlyingObject().getModifyingContextUnsafe() == this) &&
-                            v == getFirstReadTimestamp()) {
-                        return accessFunction.access(o);
-                    }
-                    throw new ConcurrentModificationException();
-                });
-            } catch (ConcurrentModificationException cme) {
-                // It turned out version was wrong, so we're going to have to do
-                // some work.
-            }
+        try {
+            return proxy.getUnderlyingObject().optimisticallyReadAndRetry((v, o) -> {
+                // to ensure snapshot isolation, we should only read from
+                // the first read timestamp.
+                        // Either not in a TX
+                if ( (!proxy.getUnderlyingObject().isTransactionallyModifiedUnsafe() ||
+                        // Or we are the TX
+                        proxy.getUnderlyingObject().getModifyingContextUnsafe() == this) &&
+                        v == getFirstReadTimestamp() &&
+                        getNumberTotalUpdates(proxy.getStreamID()) ==
+                                proxy.getUnderlyingObject().getOptimisticVersionUnsafe()
+                        ) {
+                    return accessFunction.access(o);
+                }
+                throw new ConcurrentModificationException();
+            });
+        } catch (ConcurrentModificationException cme) {
+            // It turned out version was wrong, so we're going to have to do
+            // some work.
         }
 
         // Now we're going to do some work to modify the object, so take the write
@@ -352,7 +319,7 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
             }
             // If we still don't have the upcall, this must be a bug.
             throw new RuntimeException("Tried to get upcall during a transaction but" +
-            "we don't have it even after an optimistic sync");
+            " we don't have it even after an optimistic sync");
         });
     }
 
@@ -368,21 +335,6 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
         writeSet.putIfAbsent(proxy.getStreamID(), new LinkedList<>());
         writeSet.get(proxy.getStreamID()).add(new UpcallWrapper(updateEntry));
         return writeSet.get(proxy.getStreamID()).size() - 1;
-    }
-
-    /** Abort this transaction context, restoring the state
-     * of any object we've touched.
-     */
-    @Override
-    @SuppressWarnings("unchecked")
-    public void abortTransaction() {
-        // Every object with a write set will have
-        // an active write set pointer.
-        writeSetPointer.keySet().forEach(proxy ->
-            proxy.getUnderlyingObject().writeReturnVoid((ver, obj) -> {
-                rollbackUnsafe(proxy);
-            }));
-        super.abortTransaction();
     }
 
     /** Determine whether or not we can abort all the writes
@@ -406,29 +358,12 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
      */
     @SuppressWarnings("unchecked")
     public void addTransaction(AbstractTransactionalContext tc) {
-            // flatter newer tx maps - for now we only support other optimistic txns
-            if (!(tc instanceof OptimisticTransactionalContext)) {
-                throw new RuntimeException("only optimistic txns are supported");
-            }
-            OptimisticTransactionalContext opt = (OptimisticTransactionalContext)
-                    tc;
-            // make sure the txn is syncd for all proxies
-            readSet.addAll(opt.readSet);
-            opt.writeSet.entrySet().stream().forEach(e-> {
-                writeSet.putIfAbsent(e.getKey(), new LinkedList<>());
-                writeSet.get(e.getKey()).addAll(e.getValue());
-                // also update all the pointers
-                Set<ICorfuSMRProxyInternal> proxies = writeSetPointer
-                        .keySet().stream()
-                        .filter(x -> x.getStreamID().equals(e.getKey()))
-                        .collect(Collectors.toSet());;
-                proxies.forEach(x -> {
-                    x.getUnderlyingObject().writeReturnVoid((v,o) -> {
-                        opt.syncUnsafe(x);
-                    });
-                    writeSetPointer.put(x, e.getValue().size());
-                });
-            });
+        // make sure the txn is syncd for all proxies
+        readSet.addAll(tc.getReadSet());
+        tc.getWriteSet().entrySet().forEach(e-> {
+            writeSet.putIfAbsent(e.getKey(), new LinkedList<>());
+            writeSet.get(e.getKey()).addAll(e.getValue());
+        });
     }
 
     /** Commit the transaction. If it is the last transaction in the stack,
@@ -442,7 +377,7 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
 
         // If the transaction is nested, fold the transaction.
         if (TransactionalContext.isInNestedTransaction()) {
-
+            getParentContext().addTransaction(this);
             return AbstractTransactionalContext.FOLDED_ADDRESS;
         }
 

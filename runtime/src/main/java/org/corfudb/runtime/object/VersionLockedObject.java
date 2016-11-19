@@ -1,5 +1,6 @@
 package org.corfudb.runtime.object;
 
+import lombok.Getter;
 import org.corfudb.protocols.logprotocol.SMREntry;
 import org.corfudb.runtime.object.transactions.AbstractTransactionalContext;
 import org.corfudb.runtime.object.transactions.TransactionalContext;
@@ -26,6 +27,13 @@ public class VersionLockedObject<T> {
     AbstractTransactionalContext modifyingContext;
     Deque<SMREntry> undoLog;
     int optimisticUndoPointer;
+
+    int optimisticVersion;
+
+    public int getOptimisticVersionUnsafe() {
+        return this.optimisticVersion;
+    }
+
     // maybe this shouldn't be constant.
     static final int MAX_UNDO_SIZE = 50;
 
@@ -35,7 +43,16 @@ public class VersionLockedObject<T> {
         this.sv = sv;
         this.undoLog = new LinkedList<>();
         this.optimisticUndoPointer = 0;
+        this.optimisticVersion = 0;
         lock = new StampedLock();
+    }
+
+    public void clearOptimisticVersionUnsafe() {
+        this.optimisticVersion = 0;
+    }
+
+    public void optimisticVersionIncrementUnsafe() {
+        this.optimisticVersion++;
     }
 
     public void addUndoRecord(SMREntry record) {
@@ -48,7 +65,7 @@ public class VersionLockedObject<T> {
     public void addOptimisticUndoRecord(SMREntry record) {
         // If the optimistic pointer is at -1, we
         // stop logging because we can't undo the optimistic
-        // write anymore.
+        // writes anymore.
         if (optimisticUndoPointer != -1) {
             undoLog.push(record);
             if (undoLog.size() > MAX_UNDO_SIZE) {

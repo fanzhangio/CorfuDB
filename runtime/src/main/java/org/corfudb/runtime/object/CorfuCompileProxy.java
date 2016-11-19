@@ -300,6 +300,7 @@ public class CorfuCompileProxy<T> implements ICorfuSMRProxyInternal<T> {
     public void resetObjectUnsafe(VersionLockedObject<T> object) {
         try {
             object.setObjectUnsafe(getNewInstance());
+            object.clearOptimisticVersionUnsafe();
         } catch (InstantiationException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
